@@ -61,6 +61,28 @@ contacts-cli search "@acme.com"
 contacts-cli search "+61 4"
 ```
 
+`--format json` prints the matching contacts as a JSON array instead, for use by other tools. Only the data goes to stdout. No matches, or no contacts imported yet, is `[]`, and errors (such as a corrupt contacts file) go to stderr with a non-zero exit status.
+
+```
+contacts-cli search --format json alice
+```
+
+```json
+[
+  {
+    "name": "Alice Smith",
+    "emails": ["alice@acme.com"],
+    "phones": ["+61491570006", "+61400000000"],
+    "organization": "Acme Corp",
+    "notes": null
+  }
+]
+```
+
+Each contact has the fields it is stored with (see [Data format](#data-format)): `emails` and `phones` are arrays that may be empty, and `organization` and `notes` may be `null`. Phone numbers are cleaned when imported (see above). Use `--` before a query that starts with a dash: `contacts-cli search --format json -- "-x"`.
+
+[alfred-contacts-cli-workflow](https://github.com/quintrino/alfred-contacts-cli-workflow) is an Alfred workflow built on this output.
+
 ---
 
 ### `contacts-cli message --<transport> <QUERY>`

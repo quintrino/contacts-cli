@@ -30,6 +30,9 @@ enum Commands {
     Search {
         /// Query string to search for
         query: String,
+        /// How to print the results
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
     /// Open a messaging app for the top search result
     Message {
@@ -38,6 +41,14 @@ enum Commands {
         #[command(flatten)]
         transport: TransportFlags,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Coloured, human-readable text
+    Text,
+    /// A JSON array of the matching contacts
+    Json,
 }
 
 /// Which app or URI scheme to open. At most one may be given.
@@ -431,12 +442,18 @@ fn cmd_import(file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(query: &str) -> Result<Vec<Contact>> {
+fn cmd_search(query: &str, format: OutputFormat) -> Result<()> {
     let contacts = load_contacts()?;
     let results: Vec<Contact> = contacts
         .into_iter()
         .filter(|c| c.matches(query))
         .collect();
+
+    if format == OutputFormat::Json {
+        // Nothing but the data goes to stdout, so it can be piped into other tools.
+        println!("{}", results_json(&results)?);
+        return Ok(());
+    }
 
     if results.is_empty() {
         println!("{}", format!("No contacts matching '{}'", query).yellow());
@@ -452,7 +469,14 @@ fn cmd_search(query: &str) -> Result<Vec<Contact>> {
         }
     }
 
-    Ok(results)
+    Ok(())
+}
+
+/// The matching contacts as a pretty-printed JSON array, with the same fields
+/// they are stored with (`name`, `emails`, `phones`, `organization`, `notes`).
+/// No matches is an empty array.
+fn results_json(results: &[Contact]) -> Result<String> {
+    serde_json::to_string_pretty(results).context("Cannot serialise search results")
 }
 
 // ─── MESSAGING TRANSPORTS ───────────────────────────────────────────────────
@@ -659,7 +683,7 @@ fn main() {
 
     let result = match &cli.command {
         Commands::Import { file } => cmd_import(file),
-        Commands::Search { query } => cmd_search(query).map(|_| ()),
+        Commands::Search { query, format } => cmd_search(query, *format),
         Commands::Message { query, transport } => cmd_message(query, transport.selected()),
     };
 
@@ -1164,5 +1188,80 @@ E-mail 1 - Label,E-mail 1 - Value,E-mail 2 - Value,Phone 1 - Value,Phone 2 - Val
         let error = parse_google_csv(&PathBuf::from("/definitely/not/here.csv")).unwrap_err();
 
         assert!(error.to_string().contains("Cannot open CSV file"), "{error}");
+    }
+
+    // ── JSON search results ─────────────────────────────────────────────────
+
+    #[test]
+    fn results_json_is_an_array_of_contacts_with_their_stored_fields() {
+        let alice = Contact {
+            name: "Alice Smith".to_string(),
+            emails: vec!["a@example.com".to_string()],
+            phones: vec!["+61491570006".to_string()],
+            organization: Some("Acme".to_string()),
+            notes: None,
+        };
+
+        let value: serde_json::Value =
+            serde_json::from_str(&results_json(&[alice]).unwrap()).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "name": "Alice Smith",
+                "emails": ["a@example.com"],
+                "phones": ["+61491570006"],
+                "organization": "Acme",
+                "notes": null
+            }])
+        );
+    }
+
+    #[test]
+    fn results_json_with_no_matches_is_an_empty_array() {
+        assert_eq!(results_json(&[]).unwrap(), "[]");
+    }
+
+    #[test]
+    fn results_json_keeps_every_number_and_email_in_order() {
+        let c = contact(
+            &["+61491570006", "+61400000000"],
+            &["a@example.com", "b@example.com"],
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&results_json(&[c]).unwrap()).unwrap();
+
+        assert_eq!(value[0]["phones"], serde_json::json!(["+61491570006", "+61400000000"]));
+        assert_eq!(value[0]["emails"], serde_json::json!(["a@example.com", "b@example.com"]));
+    }
+
+    #[test]
+    fn search_no_longer_accepts_the_old_message_subtitle_flag() {
+        assert!(Cli::try_parse_from([
+            "contacts-cli", "search", "--format", "json", "--message-subtitle", "x", "a"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn search_format_defaults_to_text_and_accepts_json() {
+        let format = |args: &[&str]| {
+            let mut argv = vec!["contacts-cli", "search"];
+            argv.extend_from_slice(args);
+            argv.push("alice");
+            match Cli::try_parse_from(argv).unwrap().command {
+                Commands::Search { format, .. } => format,
+                _ => unreachable!(),
+            }
+        };
+
+        assert_eq!(format(&[]), OutputFormat::Text);
+        assert_eq!(format(&["--format", "json"]), OutputFormat::Json);
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_format() {
+        assert!(Cli::try_parse_from(["contacts-cli", "search", "--format", "xml", "a"]).is_err());
     }
 }

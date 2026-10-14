@@ -310,3 +310,163 @@ fn imported_numbers_can_be_found_by_a_spaced_search() {
     assert!(stdout(&output).contains("+61491570006"), "{}", stdout(&output));
     assert!(!stdout(&output).contains("*31#"), "{}", stdout(&output));
 }
+
+// ── search --format json ────────────────────────────────────────────────────
+
+fn json_results(output: &Output) -> Vec<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}", stdout(output)));
+    value.as_array().expect("a JSON array").clone()
+}
+
+const JSON_CSV: &str = "\
+First Name,Last Name,Organization Name,E-mail 1 - Value,Phone 1 - Value,Phone 2 - Value
+Alice,Smith,Acme Corp,alice@acme.com,+61 491 570 006,+61 400 000 000
+Bob,Jones,,bob@example.com,,
+Carol,White,,,,
+";
+
+#[test]
+fn json_format_prints_an_array_of_the_matching_contacts() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "alice"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        json_results(&output),
+        [serde_json::json!({
+            "name": "Alice Smith",
+            "emails": ["alice@acme.com"],
+            "phones": ["+61491570006", "+61400000000"],
+            "organization": "Acme Corp",
+            "notes": null
+        })]
+    );
+}
+
+#[test]
+fn json_format_prints_only_json_on_stdout() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "alice"]);
+
+    let text = stdout(&output);
+    assert!(text.trim_start().starts_with('['), "{text}");
+    assert!(!text.contains("result(s)") && !text.contains('\u{1b}'), "{text}");
+}
+
+#[test]
+fn json_format_keeps_contacts_without_a_phone_or_an_email() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "bob"]);
+    let bob = &json_results(&output)[0];
+    assert_eq!(bob["phones"], serde_json::json!([]));
+    assert_eq!(bob["emails"], serde_json::json!(["bob@example.com"]));
+
+    let output = sandbox.run(&["search", "--format", "json", "carol"]);
+    let carol = &json_results(&output)[0];
+    assert_eq!(carol["phones"], serde_json::json!([]));
+    assert_eq!(carol["emails"], serde_json::json!([]));
+}
+
+#[test]
+fn json_format_with_an_empty_query_lists_every_contact() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", ""]);
+
+    let names: Vec<String> = json_results(&output)
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["Alice Smith", "Bob Jones", "Carol White"]);
+}
+
+#[test]
+fn json_format_with_no_match_is_an_empty_array_and_succeeds() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "zzz"]);
+
+    assert!(output.status.success());
+    assert!(json_results(&output).is_empty());
+}
+
+#[test]
+fn json_format_before_any_import_is_an_empty_array() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["search", "--format", "json", "alice"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(json_results(&output).is_empty());
+}
+
+#[test]
+fn json_format_reports_a_corrupt_contacts_file_on_stderr_with_a_failing_exit() {
+    let sandbox = Sandbox::new();
+    fs::create_dir_all(sandbox.contacts_json().parent().unwrap()).unwrap();
+    fs::write(sandbox.contacts_json(), "not json").unwrap();
+
+    let output = sandbox.run(&["search", "--format", "json", "alice"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("Cannot parse contacts file"), "{}", stderr(&output));
+    assert!(stdout(&output).trim().is_empty(), "{}", stdout(&output));
+}
+
+#[test]
+fn json_format_matches_numbers_typed_with_spaces() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "+61 491 570"]);
+
+    assert_eq!(json_results(&output)[0]["name"], "Alice Smith");
+}
+
+#[test]
+fn a_query_that_looks_like_a_flag_can_follow_double_dash() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "--format", "json", "--", "--help"]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(json_results(&output).is_empty());
+}
+
+#[test]
+fn the_text_format_is_still_the_default() {
+    let sandbox = Sandbox::new();
+    sandbox.import(JSON_CSV);
+
+    let output = sandbox.run(&["search", "alice"]);
+
+    assert!(stdout(&output).contains("1 result(s)"), "{}", stdout(&output));
+}
+
+#[test]
+fn an_unknown_format_is_rejected() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["search", "--format", "xml", "alice"]);
+
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn the_old_message_subtitle_flag_is_gone() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&["search", "--format", "json", "--message-subtitle", "x", "alice"]);
+
+    assert_eq!(output.status.code(), Some(2));
+}
