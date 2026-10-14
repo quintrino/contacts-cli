@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute release tag
+        id: meta
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "tag=v${version}-build.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="contacts-cli-${{ steps.meta.outputs.tag }}-${{ matrix.target }}"
+          tar -C "target/${{ matrix.target }}/release" -czf "$name.tar.gz" contacts-cli
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: contacts-cli-*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tag="v${version}-build.${{ github.run_number }}"
+          gh release create "$tag" dist/* \
+            --target "${{ github.sha }}" \
+            --title "$tag" \
+            --generate-notes
+
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tag="v${version}-build.${{ github.run_number }}"
+          # Homebrew needs a plain dotted version so upgrades order numerically
+          brew_version="${version}.${{ github.run_number }}"
+          base="https://github.com/${{ github.repository }}/releases/download/${tag}"
+
+          sha() { cut -d' ' -f1 "dist/contacts-cli-${tag}-$1.tar.gz.sha256"; }
+          url() { echo "${base}/contacts-cli-${tag}-$1.tar.gz"; }
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/quintrino/homebrew-tap.git" tap
+          cat > tap/Formula/contacts-cli.rb <<RUBY
+          class ContactsCli < Formula
+            desc "A fast terminal contact manager with Google Contacts import"
+            homepage "https://github.com/${{ github.repository }}"
+            version "${brew_version}"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "$(url aarch64-apple-darwin)"
+                sha256 "$(sha aarch64-apple-darwin)"
+              else
+                url "$(url x86_64-apple-darwin)"
+                sha256 "$(sha x86_64-apple-darwin)"
+              end
+            end
+
+            on_linux do
+              url "$(url x86_64-unknown-linux-gnu)"
+              sha256 "$(sha x86_64-unknown-linux-gnu)"
+            end
+
+            def install
+              bin.install "contacts-cli"
+            end
+
+            test do
+              system "#{bin}/contacts-cli", "--version"
+            end
+          end
+          RUBY
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/contacts-cli.rb
+          git commit -m "contacts-cli ${brew_version}"
+          for i in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1
