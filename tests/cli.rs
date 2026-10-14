@@ -123,7 +123,7 @@ fn reimporting_updates_existing_contacts_instead_of_duplicating_them() {
     // Alice replaced (matched case-insensitively), Bob and Orphans kept, Carol added.
     assert_eq!(contacts.len(), 4);
     let alice = contacts.iter().find(|c| c["name"] == "alice SMITH").unwrap();
-    assert_eq!(alice["phones"][0], "+61 499 999 999");
+    assert_eq!(alice["phones"][0], "+61499999999");
 }
 
 #[test]
@@ -279,4 +279,34 @@ fn version_flag_reports_the_package_version() {
         stdout(&output).trim(),
         format!("contacts-cli {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn import_saves_a_doubled_mmi_prefixed_number_as_one_clean_number() {
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.import(
+        "First Name,Last Name,Phone 1 - Value\n\
+         Alice,Smith,*31#+61 491 570 006 ::: *31#+61 491 570 006\n",
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stored = fs::read_to_string(sandbox.contacts_json()).unwrap();
+    let contacts: Vec<serde_json::Value> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(contacts[0]["phones"], serde_json::json!(["+61491570006"]));
+}
+
+#[test]
+fn imported_numbers_can_be_found_by_a_spaced_search() {
+    let sandbox = Sandbox::new();
+    sandbox.import(
+        "First Name,Last Name,Phone 1 - Value\n\
+         Alice,Smith,*31#+61 491 570 006 ::: *31#+61 491 570 006\n",
+    );
+
+    let output = sandbox.run(&["search", "+61 491 570"]);
+
+    assert!(stdout(&output).contains("Alice Smith"), "{}", stdout(&output));
+    assert!(stdout(&output).contains("+61491570006"), "{}", stdout(&output));
+    assert!(!stdout(&output).contains("*31#"), "{}", stdout(&output));
 }

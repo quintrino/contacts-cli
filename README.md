@@ -37,6 +37,15 @@ contacts-cli import ~/Downloads/contacts.csv
 
 Export your contacts from Google Contacts → **Export** → **Google CSV**.
 
+Phone numbers are cleaned on import:
+
+- A leading MMI (supplementary service) code such as `*31#` or `#31#` is removed.
+- Numbers are saved as digits with a leading `+` kept, so `*31#+61 491 570 006` is saved as `+61491570006`.
+- Google joins several values in one cell with ` ::: `, and sometimes repeats a number. Each number is saved once, across all of a contact's phone columns.
+- Numbers with letters (extensions like `x12`) are only trimmed, not reduced to digits.
+
+Different formats of one number are only merged when they clean to the same string, so `0491 570 006` and `+61 491 570 006` stay as two entries. Re-run `import` to clean numbers already stored from an earlier import.
+
 Contacts are stored in `$XDG_DATA_HOME/contacts-cli/contacts.json`
 (defaults to `~/.local/share/contacts-cli/contacts.json`).
 
@@ -44,7 +53,7 @@ Contacts are stored in `$XDG_DATA_HOME/contacts-cli/contacts.json`
 
 ### `contacts-cli search <QUERY>`
 
-Search by name, email, phone, or organisation. Case-insensitive, substring match.
+Search by name, email, phone, or organisation. Case-insensitive, substring match. A query that looks like a number (`+61 4`, `(0412) 345`) is compared by digits, so spacing and punctuation don't matter.
 
 ```
 contacts-cli search alice
@@ -114,7 +123,7 @@ Each contact looks like:
 {
   "name": "Alice Smith",
   "emails": ["alice@example.com"],
-  "phones": ["+61 412 345 678"],
+  "phones": ["+61412345678"],
   "organization": "Acme Corp",
   "notes": null
 }

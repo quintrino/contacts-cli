@@ -111,6 +111,21 @@ impl Contact {
         if self.phones.iter().any(|p| p.to_lowercase().contains(&q)) {
             return true;
         }
+        // Stored numbers have no spaces or punctuation, so a query typed the way
+        // a number is usually written ("+61 4", "(0412) 345") is compared by
+        // digits. Only for queries that look like a number, so a name such as
+        // "alice1" doesn't match every phone containing a 1.
+        let number_like = q.chars().all(|c| c.is_ascii_digit() || " +-().".contains(c));
+        let query_digits: String = q.chars().filter(char::is_ascii_digit).collect();
+        if number_like
+            && !query_digits.is_empty()
+            && self
+                .phones
+                .iter()
+                .any(|p| p.chars().filter(char::is_ascii_digit).collect::<String>().contains(&query_digits))
+        {
+            return true;
+        }
         if let Some(org) = &self.organization {
             if org.to_lowercase().contains(&q) {
                 return true;
@@ -152,6 +167,46 @@ fn clean_phone(raw: &str) -> String {
     let plus = if raw.starts_with('+') { "+" } else { "" };
     let digits: String = raw.chars().filter(char::is_ascii_digit).collect();
     format!("{plus}{digits}")
+}
+
+/// Drop a leading MMI (supplementary service) code such as `*31#` (hide caller
+/// ID), `#31#` (show caller ID) or `*#31#` from a phone number. The code is the
+/// leading run of `*`, `#` and digits up to its last `#`; whatever follows is the
+/// number. Strings that don't start with `*` or `#` are returned unchanged.
+fn strip_mmi(raw: &str) -> &str {
+    let raw = raw.trim();
+    if !raw.starts_with(['*', '#']) {
+        return raw;
+    }
+    let run = raw
+        .find(|c: char| !(c == '*' || c == '#' || c.is_ascii_digit()))
+        .unwrap_or(raw.len());
+    match raw[..run].rfind('#') {
+        Some(end) => raw[end + 1..].trim(),
+        None => raw,
+    }
+}
+
+/// Turn one exported phone cell into clean numbers. The cell may hold several
+/// values joined with `:::`. Each has any MMI code removed and is reduced to
+/// digits with an optional leading `+`, so `*31#+61 491 570 006` becomes
+/// `+61491570006`. Numbers with letters or pause characters (extensions such as
+/// `x12`) are only trimmed, because dropping those would merge the extension into
+/// the number. Repeats within the cell are removed.
+fn normalize_phone_cell(cell: &str) -> Vec<String> {
+    let mut numbers: Vec<String> = Vec::new();
+    for part in cell.split(":::") {
+        let number = strip_mmi(part);
+        let cleaned = if number.chars().any(|c| c.is_alphabetic() || c == ',' || c == ';') {
+            number.to_string()
+        } else {
+            clean_phone(number)
+        };
+        if cleaned.chars().any(|c| c.is_ascii_digit()) && !numbers.contains(&cleaned) {
+            numbers.push(cleaned);
+        }
+    }
+    numbers
 }
 
 // ─── GOOGLE CONTACTS CSV PARSING ────────────────────────────────────────────
@@ -237,17 +292,21 @@ fn parse_google_csv(path: &PathBuf) -> Result<Vec<Contact>> {
         };
 
         // ── Phones ────────────────────────────────────────────────────────────
-        // Columns: "Phone 1 - Value", "Phone 2 - Value", … up to however many exist
-        let phones: Vec<String> = (1..=20)
-            .filter_map(|i| {
-                let key = format!("Phone {} - Value", i);
-                row.get(key.as_str())
-                    .copied()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(String::from)
-            })
-            .collect();
+        // Columns: "Phone 1 - Value", "Phone 2 - Value", … up to however many exist.
+        // A cell can hold several numbers joined with " ::: ", and numbers can
+        // carry an MMI code or repeat across columns, so clean and de-duplicate.
+        let mut phones: Vec<String> = Vec::new();
+        for i in 1..=20 {
+            let key = format!("Phone {} - Value", i);
+            let Some(cell) = row.get(key.as_str()) else {
+                continue;
+            };
+            for phone in normalize_phone_cell(cell) {
+                if !phones.contains(&phone) {
+                    phones.push(phone);
+                }
+            }
+        }
 
         // ── Emails ────────────────────────────────────────────────────────────
         // Columns: "E-mail 1 - Value", "E-mail 2 - Value", …
@@ -924,7 +983,7 @@ E-mail 1 - Label,E-mail 1 - Value,E-mail 2 - Value,Phone 1 - Value,Phone 2 - Val
         let c = &contacts[0];
 
         assert_eq!(c.emails, ["a@x.com", "b@x.com"]);
-        assert_eq!(c.phones, ["+61 412 345 678", "+61 400 000 000"]);
+        assert_eq!(c.phones, ["+61412345678", "+61400000000"]);
         assert_eq!(c.organization.as_deref(), Some("Acme"));
         assert_eq!(c.notes.as_deref(), Some("hello"));
     }
@@ -986,7 +1045,118 @@ E-mail 1 - Label,E-mail 1 - Value,E-mail 2 - Value,Phone 1 - Value,Phone 2 - Val
 
         assert_eq!(contacts[0].name, "Alice Smith");
         assert_eq!(contacts[0].organization.as_deref(), Some("Acme"));
-        assert_eq!(contacts[0].phones, ["+61 412 345 678"]);
+        assert_eq!(contacts[0].phones, ["+61412345678"]);
+    }
+
+    // ── phone cleaning on import ────────────────────────────────────────────
+
+    #[test]
+    fn strip_mmi_removes_caller_id_and_other_service_codes() {
+        assert_eq!(strip_mmi("*31#+61 491 570 006"), "+61 491 570 006");
+        assert_eq!(strip_mmi("#31#+61 491 570 006"), "+61 491 570 006");
+        assert_eq!(strip_mmi("*#31#+61 491 570 006"), "+61 491 570 006");
+        assert_eq!(strip_mmi("*67#0491 570 006"), "0491 570 006");
+        assert_eq!(strip_mmi("*31#0491570006"), "0491570006");
+    }
+
+    #[test]
+    fn strip_mmi_leaves_ordinary_numbers_alone() {
+        assert_eq!(strip_mmi("+61 491 570 006"), "+61 491 570 006");
+        assert_eq!(strip_mmi("  0491 570 006 "), "0491 570 006");
+    }
+
+    #[test]
+    fn strip_mmi_on_a_bare_code_leaves_nothing() {
+        assert_eq!(strip_mmi("*100#"), "");
+    }
+
+    #[test]
+    fn a_doubled_number_with_mmi_codes_becomes_one_clean_number() {
+        assert_eq!(
+            normalize_phone_cell("*31#+61 491 570 006 ::: *31#+61 491 570 006"),
+            ["+61491570006"]
+        );
+    }
+
+    #[test]
+    fn a_cell_with_several_different_numbers_keeps_each_once() {
+        assert_eq!(
+            normalize_phone_cell("+61 491 570 006 ::: +61 400 000 000 ::: +61 491 570 006"),
+            ["+61491570006", "+61400000000"]
+        );
+    }
+
+    #[test]
+    fn same_number_in_different_formats_is_one_number() {
+        assert_eq!(
+            normalize_phone_cell("*31#+61 491 570 006 ::: +61-491-570-006 ::: +61 (491) 570 006"),
+            ["+61491570006"]
+        );
+    }
+
+    #[test]
+    fn empty_cells_and_bare_codes_give_no_numbers() {
+        assert!(normalize_phone_cell("").is_empty());
+        assert!(normalize_phone_cell("   ").is_empty());
+        assert!(normalize_phone_cell("*100# ::: ").is_empty());
+        assert!(normalize_phone_cell("+").is_empty());
+    }
+
+    #[test]
+    fn numbers_with_extensions_are_trimmed_but_not_digit_merged() {
+        assert_eq!(normalize_phone_cell("+61 2 1234 5678 x12"), ["+61 2 1234 5678 x12"]);
+    }
+
+    #[test]
+    fn csv_phone_with_mmi_code_and_repeat_is_saved_as_one_clean_number() {
+        let contacts = parse(&[
+            "Alice,,Smith,,,,,*31#+61 491 570 006 ::: *31#+61 491 570 006,,",
+        ]);
+
+        assert_eq!(contacts[0].phones, ["+61491570006"]);
+    }
+
+    #[test]
+    fn csv_same_number_in_two_phone_columns_is_saved_once() {
+        let contacts = parse(&["Alice,,Smith,,,,,+61 491 570 006,*31#+61 491 570 006,"]);
+
+        assert_eq!(contacts[0].phones, ["+61491570006"]);
+    }
+
+    #[test]
+    fn csv_different_numbers_in_separate_columns_are_both_kept() {
+        let contacts = parse(&["Alice,,Smith,,,,,+61 491 570 006,+61 400 000 000,"]);
+
+        assert_eq!(contacts[0].phones, ["+61491570006", "+61400000000"]);
+    }
+
+    #[test]
+    fn phone_search_ignores_spaces_and_punctuation_in_the_query() {
+        let c = Contact {
+            name: "Alice Smith".to_string(),
+            emails: vec![],
+            phones: vec!["+61491570006".to_string()],
+            organization: None,
+            notes: None,
+        };
+
+        assert!(c.matches("+61 491"));
+        assert!(c.matches("(491) 570-006"));
+        assert!(c.matches("491570006"));
+    }
+
+    #[test]
+    fn digits_in_a_name_like_query_do_not_match_phone_numbers() {
+        let c = Contact {
+            name: "Alice Smith".to_string(),
+            emails: vec![],
+            phones: vec!["+61491570006".to_string()],
+            organization: None,
+            notes: None,
+        };
+
+        assert!(!c.matches("alice1"));
+        assert!(!c.matches("a4"));
     }
 
     #[test]
