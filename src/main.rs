@@ -424,16 +424,17 @@ impl Transport {
         }
     }
 
-    /// macOS app to bring to the front after the URI is opened, if any.
-    fn app(self) -> Option<&'static str> {
+    /// macOS apps that can handle this transport, most preferred first. The
+    /// first one that is installed is the one the URI is opened with.
+    fn apps(self) -> &'static [&'static str] {
         match self {
-            Transport::Signal => Some("Signal"),
-            Transport::WhatsApp => Some("WhatsApp"),
-            Transport::Telegram => Some("Telegram"),
-            Transport::IMessage | Transport::Sms => Some("Messages"),
-            Transport::FaceTime => Some("FaceTime"),
+            Transport::Signal => &["Signal", "Signal Beta"],
+            Transport::WhatsApp => &["WhatsApp"],
+            Transport::Telegram => &["Telegram"],
+            Transport::IMessage | Transport::Sms => &["Messages"],
+            Transport::FaceTime => &["FaceTime"],
             // These go to whatever app the system has chosen as the handler.
-            Transport::Tel | Transport::Email => None,
+            Transport::Tel | Transport::Email => &[],
         }
     }
 
@@ -501,12 +502,71 @@ fn cmd_message(query: &str, transport: Option<Transport>) -> Result<()> {
         top.name.bold(),
         address.dimmed()
     );
-    open_url(&url)?;
-    if let Some(app) = transport.app() {
-        focus_app(app);
-    }
+    launch(transport, &url)
+}
 
-    Ok(())
+/// Open the URI in the first installed app for the transport, falling back to
+/// the system's default handler for the URI when none is found.
+fn launch(transport: Transport, url: &str) -> Result<()> {
+    if let Some(app) = open_with_installed_app(transport.apps(), url)? {
+        println!("{} Opened with {}", "→".cyan().bold(), app.bold());
+        return Ok(());
+    }
+    open_url(url)
+}
+
+/// Directories macOS apps are installed in.
+fn app_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+        PathBuf::from("/System/Applications/Utilities"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    dirs
+}
+
+/// The first of `candidates` (in priority order) that has an `<name>.app`
+/// bundle in any of `dirs`.
+fn find_app<'a>(candidates: &[&'a str], dirs: &[PathBuf]) -> Option<&'a str> {
+    candidates.iter().copied().find(|name| {
+        dirs.iter()
+            .any(|dir| dir.join(format!("{name}.app")).exists())
+    })
+}
+
+/// Open `url` with an installed app from `candidates` and bring it to the front.
+/// `open -a` targets that exact app rather than whichever one macOS registered
+/// as the URI handler, which matters when only a variant like "Signal Beta" is
+/// installed. Returns the app used, or `None` if none was found (or it failed to
+/// open the URI), so the caller can fall back to the default handler.
+#[cfg(target_os = "macos")]
+fn open_with_installed_app(candidates: &[&str], url: &str) -> Result<Option<String>> {
+    let Some(app) = find_app(candidates, &app_dirs()) else {
+        return Ok(None);
+    };
+    let status = Command::new("open")
+        .args(["-a", app, url])
+        .status()
+        .context("Failed to launch open")?;
+    if status.success() {
+        Ok(Some(app.to_string()))
+    } else {
+        eprintln!(
+            "{}",
+            format!("Could not open the link with {app}; trying the default handler").yellow()
+        );
+        Ok(None)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_with_installed_app(_candidates: &[&str], _url: &str) -> Result<Option<String>> {
+    // `find_app` and `app_dirs` only matter on macOS.
+    let _ = (find_app, app_dirs);
+    Ok(None)
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -532,20 +592,6 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Switch to the app once its URI has been handed over. Opening a URI does not
-/// always raise the app's window (Electron apps like Signal often stay in the
-/// background), so on macOS ask the system to activate it explicitly. Linux and
-/// Windows have no equivalent, so the URI handler decides there.
-#[cfg(target_os = "macos")]
-fn focus_app(app: &str) {
-    match Command::new("open").args(["-a", app]).status() {
-        Ok(status) if status.success() => {}
-        _ => eprintln!("{}", format!("Could not switch to {app}").yellow()),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn focus_app(_app: &str) {}
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
@@ -651,12 +697,110 @@ mod tests {
     }
 
     #[test]
-    fn app_transports_are_brought_to_the_front_and_system_handlers_are_not() {
-        assert_eq!(Transport::Signal.app(), Some("Signal"));
-        assert_eq!(Transport::Sms.app(), Some("Messages"));
-        assert_eq!(Transport::IMessage.app(), Some("Messages"));
-        assert_eq!(Transport::Tel.app(), None);
-        assert_eq!(Transport::Email.app(), None);
+    fn app_transports_name_their_apps_and_system_handlers_name_none() {
+        assert_eq!(Transport::Signal.apps(), ["Signal", "Signal Beta"]);
+        assert_eq!(Transport::Sms.apps(), ["Messages"]);
+        assert_eq!(Transport::IMessage.apps(), ["Messages"]);
+        assert!(Transport::Tel.apps().is_empty());
+        assert!(Transport::Email.apps().is_empty());
+    }
+
+    // ── find_app ────────────────────────────────────────────────────────────
+
+    /// A scratch directory in the OS temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "contacts-cli-apps-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn install(&self, app: &str) {
+            std::fs::create_dir_all(self.0.join(format!("{app}.app"))).unwrap();
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn find_app_returns_signal_when_only_signal_is_installed() {
+        let dir = TempDir::new();
+        dir.install("Signal");
+
+        assert_eq!(find_app(Transport::Signal.apps(), &[dir.0.clone()]), Some("Signal"));
+    }
+
+    #[test]
+    fn find_app_returns_signal_beta_when_only_the_beta_is_installed() {
+        let dir = TempDir::new();
+        dir.install("Signal Beta");
+
+        assert_eq!(
+            find_app(Transport::Signal.apps(), &[dir.0.clone()]),
+            Some("Signal Beta")
+        );
+    }
+
+    #[test]
+    fn find_app_prefers_signal_over_the_beta_when_both_are_installed() {
+        let dir = TempDir::new();
+        dir.install("Signal Beta");
+        dir.install("Signal");
+
+        assert_eq!(find_app(Transport::Signal.apps(), &[dir.0.clone()]), Some("Signal"));
+    }
+
+    #[test]
+    fn find_app_prefers_the_higher_priority_app_even_in_a_later_directory() {
+        let first = TempDir::new();
+        let second = TempDir::new();
+        first.install("Signal Beta");
+        second.install("Signal");
+
+        let dirs = [first.0.clone(), second.0.clone()];
+
+        assert_eq!(find_app(Transport::Signal.apps(), &dirs), Some("Signal"));
+    }
+
+    #[test]
+    fn find_app_looks_in_every_directory() {
+        let first = TempDir::new();
+        let second = TempDir::new();
+        second.install("Signal Beta");
+
+        let dirs = [first.0.clone(), second.0.clone()];
+
+        assert_eq!(find_app(Transport::Signal.apps(), &dirs), Some("Signal Beta"));
+    }
+
+    #[test]
+    fn find_app_returns_none_when_nothing_is_installed() {
+        let dir = TempDir::new();
+        dir.install("Slack");
+
+        assert_eq!(find_app(Transport::Signal.apps(), &[dir.0.clone()]), None);
+    }
+
+    #[test]
+    fn find_app_ignores_a_missing_directory_and_an_empty_candidate_list() {
+        let dir = TempDir::new();
+        dir.install("Signal");
+        let missing = dir.0.join("nope");
+
+        assert_eq!(find_app(Transport::Signal.apps(), &[missing]), None);
+        assert_eq!(find_app(Transport::Tel.apps(), &[dir.0.clone()]), None);
     }
 
     fn selected(args: &[&str]) -> Result<Option<Transport>, clap::Error> {

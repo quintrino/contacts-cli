@@ -80,12 +80,23 @@ and Telegram take the number without the `+`. Store numbers in international
 format (`+<country code>…`): Signal, WhatsApp and Telegram don't resolve
 local-format numbers like `0412 345 678`. `--email` uses the first email address.
 
-The URI is opened with `xdg-open` on Linux, `open` on macOS, or `start` on
-Windows. On macOS, the app is then brought to the front (`open -a <app>`), since
-opening a URI doesn't always raise the app's window. Signal, WhatsApp, Telegram,
-FaceTime and Messages (for `--imessage` and `--sms`) are switched to this way;
-`--tel` and `--email` go to whatever app the system has chosen as the handler.
-On Linux and Windows, the URI handler decides which window comes forward.
+On macOS the URI is opened in a specific app, which also brings it to the front
+(`open -a "<app>" <uri>`). The app is the first one found in `/Applications`,
+`/System/Applications` or `~/Applications`:
+
+| Flag | Apps tried, in order |
+|------|----------------------|
+| `--signal` | `Signal`, then `Signal Beta` |
+| `--whatsapp` | `WhatsApp` |
+| `--telegram` | `Telegram` |
+| `--imessage`, `--sms` | `Messages` |
+| `--facetime` | `FaceTime` |
+
+So with only Signal Beta installed, `--signal` opens Signal Beta. If none of the
+apps is found, or one fails to open the link, the URI goes to the system's
+default handler instead, as it always does for `--tel` and `--email`. On Linux
+the URI is opened with `xdg-open` and on Windows with `start`, and the URI
+handler decides which window comes forward.
 
 ---
 
